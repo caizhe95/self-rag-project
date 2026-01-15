@@ -50,9 +50,11 @@ class SelfRAGWebUI:
                 str(result["iteration"]),
                 json.dumps(result["sources"][:3]),
                 "查询完成",
-                True,
-                review_msg
+                review_msg,
+                json.dumps(result.get("review", {})),
+                f"{result.get('latency_ms', 0)}ms"
             )
+
         except Exception as e:
             return f"查询失败: {str(e)}", "0.00", "0", "[]", "错误", True, ""
 
@@ -86,6 +88,8 @@ def create_interface():
 
         # 答案展示区
         answer_output = gr.Markdown(label="回答内容", value="等待查询...")
+        review_details = gr.JSON(label="评估详情")
+        latency_display = gr.Textbox(label="响应延迟")
 
         # 状态区
         with gr.Row():

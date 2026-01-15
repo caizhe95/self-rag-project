@@ -2,7 +2,6 @@ import asyncio
 from typing import List
 from langchain_core.documents import Document
 from langchain_community.retrievers import BM25Retriever
-from cache.simple_cache import cached_retrieval
 from retrieval.reranker import ReRanker
 
 

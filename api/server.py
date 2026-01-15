@@ -6,12 +6,12 @@ from pydantic import BaseModel
 import uvicorn
 import json
 import uuid
+import time  # 新增
 from core.rag_chain import SelfRAGChain
 from config import Config
 
 app = FastAPI(title="Self-RAG API")
 
-# 添加生产环境CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -37,11 +37,9 @@ async def startup():
     config = Config()
     rag_chain = SelfRAGChain(config)
 
-    # 确保数据目录存在
     import os
     os.makedirs(config.VECTOR_STORE_PATH, exist_ok=True)
 
-    # 异步索引示例文档
     SAMPLE_DOCS = [
         {"text": "LangChain是一个框架...", "metadata": {"source": "doc1"}},
         {"text": "Self-RAG是增强版RAG...", "metadata": {"source": "doc2"}}
@@ -56,6 +54,7 @@ async def startup():
 @app.post("/api/query")
 async def query(req: QueryRequest, stream: bool = Query(False)):
     """统一查询接口"""
+
     if stream:
         async def generate():
             async for event in rag_chain.astream_query(req.question):
@@ -66,14 +65,33 @@ async def query(req: QueryRequest, stream: bool = Query(False)):
         return StreamingResponse(generate(), media_type="text/plain")
 
     # 同步查询
+    start_time = time.time()
+
     result = await rag_chain._run_sync(req.question)
+
+    # 计算总延迟（毫秒）
+    latency_ms = int((time.time() - start_time) * 1000)
+
+    # 将延迟添加到结果中
+    result["latency_ms"] = latency_ms
+
+    # 多维度评估字段
+    review_result = result.get("review_result") or {}
+
     return {
         "answer": result["answer"],
         "confidence": result["confidence"],
         "iteration": result["iteration"],
         "sources": result["sources"],
-        "needs_review": result.get("review_result", {}).get("needs_human_review", False),
-        "review_task_id": str(uuid.uuid4()) if result.get("review_result", {}).get("needs_human_review") else None
+        "latency_ms": latency_ms,
+        "review": {
+            "confidence": result["confidence"],
+            "retrieval_relevance": review_result.get("retrieval_relevance", 0.0),
+            "answer_completeness": review_result.get("answer_completeness", 0.0),
+            "hallucination_risk": review_result.get("hallucination_risk", 0.0),
+        } if review_result else None,
+        "needs_review": review_result.get("needs_human_review", False) if review_result else False,
+        "review_task_id": str(uuid.uuid4()) if review_result and review_result.get("needs_human_review") else None
     }
 
 

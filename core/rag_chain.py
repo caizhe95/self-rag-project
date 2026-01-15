@@ -1,5 +1,8 @@
 import asyncio
 from typing import List, Dict, Optional, AsyncIterator, Any
+import time
+
+from cache.simple_cache import MultiLevelCache
 from config import Config
 from database.vector_store import VectorStoreManager
 from retrieval.hybrid_retriever import HybridRetriever
@@ -16,7 +19,7 @@ class SelfRAGChain:
     def __init__(self, config: Config):
         self.config = config
         self.llm = self._init_llm()
-
+        self.cache = MultiLevelCache(config)
         self.vector_manager = VectorStoreManager(config)
         self.retriever = None
         self.evaluator = SelfEvaluator(self.llm, config)
@@ -78,7 +81,8 @@ class SelfRAGChain:
             "iteration": 0,
             "review_result": None,
             "human_review_decision": None,
-            "human_review_comment": ""
+            "human_review_comment": "",
+            "start_time": time.time()
         }
 
         # 流式事件

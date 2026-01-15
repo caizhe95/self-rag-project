@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import TypedDict, List, Dict, Any
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt, Command
@@ -15,6 +16,7 @@ class RAGState(TypedDict):
     review_result: Any
     human_review_decision: bool
     human_review_comment: str
+    start_time: float
 
 
 class RAGWorkflow:
@@ -47,7 +49,17 @@ class RAGWorkflow:
 
         async def evaluate(state: RAGState):
             """评估"""
-            review = await asyncio.to_thread(self.evaluator.evaluate, state["answer"], state["documents"])
+            # 计算延迟（毫秒）
+            latency_ms = int((time.time() - state.get("start_time", time.time())) * 1000)
+
+            # 多维度评估（传入延迟参数）
+            review = await asyncio.to_thread(
+                self.evaluator.evaluate,
+                state["query"],
+                state["answer"],
+                state["documents"],
+                latency_ms
+            )
 
             if review.needs_human_review:
                 review_task = self.evaluator.request_human_review(state["query"], state["answer"])
@@ -62,7 +74,7 @@ class RAGWorkflow:
                     }
                 )
 
-            return {"review_result": review, "confidence": review.confidence}
+            return {"review_result": review.__dict__, "confidence": review.confidence}
 
         async def decide_next(state: RAGState):
             """决策"""
