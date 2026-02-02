@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 # Python
 __pycache__/
 *.py[cod]
@@ -8,23 +7,46 @@ __pycache__/
 env/
 venv/
 ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # 数据
-data/
-chroma_db/
+data/chroma_db/
+data/uploads/
+*.db
+*.sqlite
+*.sqlite3
+
+# 日志
+logs/
 *.log
 
-# 环境变量
+# 环境变量（敏感）
 .env
+.env.local
+.env.production
+.env.*
 
 # IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
 
-# OS
+# 系统文件
 .DS_Store
 Thumbs.db
-EOF

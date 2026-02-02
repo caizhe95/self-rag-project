@@ -1,178 +1,361 @@
+# core/self_evaluator.py - 策略模式自适应评估器（实习面试版）
 from dataclasses import dataclass
-from enum import Enum
-from typing import List, Any, Dict
-import time
+from typing import List, Dict, Any
 from langchain_core.documents import Document
-
-
-class ReviewStatus(Enum):
-    PENDING = "pending"
-    APPROVED = "approved"
-    REJECTED = "rejected"
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+import re
+import time
 
 
 @dataclass
 class ReviewResult:
-    """多维度评估结果"""
-    confidence: float  # 答案质量分（0-1）
-    retrieval_relevance: float  # 检索相关性（0-1）
-    answer_completeness: float  # 回答完整性（0-1）
-    hallucination_risk: float  # 幻觉风险（0-1，越高越危险）
-    latency_ms: int  # 响应延迟（毫秒）
+    """评估结果"""
+    confidence: float
+    retrieval_relevance: float
+    answer_completeness: float
+    hallucination_risk: float
+    latency_ms: int
     needs_human_review: bool
-    human_review_status: ReviewStatus
     review_comment: str = ""
 
 
 class SelfEvaluator:
+    """Self-RAG 评估器 - 自动适配小模型(规则)和大模型(LLM验证)"""
+
     def __init__(self, llm, config):
         self.llm = llm
         self.config = config
 
+        # 从策略配置获取参数（自动适配小/大模型）
+        self.use_llm_contradiction = getattr(config, 'use_llm_contradiction', False)
+        self.extract_claims_max = getattr(config, 'extract_claims_max', 3)
+        self.strict_mode = getattr(config, 'strict_mode', False)
+        self.human_review_threshold = getattr(config, 'human_review_threshold', 0.4)
+
+        # 打印当前策略（一目了然）
+        model_type = "大模型(LLM矛盾检测)" if self.use_llm_contradiction else "小模型(规则矛盾检测)"
+        print(f"📊 评估器初始化: {model_type}, 严格模式={self.strict_mode}")
+
+        # 初始化提示词
+        self._init_prompts()
+
+    def _init_prompts(self):
+        """初始化提示词（小模型极简，大模型详细）"""
+        if self.strict_mode:
+            # 大模型：详细提示词
+            self.confidence_prompt = PromptTemplate.from_template(
+                """评估回答质量（0-1分），严格区分事实与推测：
+
+                0.9-1.0：完全基于资料，无外部推测
+                0.7-0.8：基于资料，含必要术语解释
+                0.5-0.6：部分基于资料，部分合理推断
+                0.3-0.4：大多推测，与资料关联弱
+                0.0-0.2：与资料矛盾或无法验证
+
+                只返回0-1之间的数字，小数点后1位。
+
+                资料：{context}
+                问题：{query}
+                回答：{answer}
+                评分："""
+            )
+        else:
+            # 小模型：极简提示词（防超时）
+            self.confidence_prompt = PromptTemplate.from_template(
+                "评估质量(0-1)，只返回数字。资料：{context} 问题：{query} 回答：{answer} 分数："
+            )
+
+        self.confidence_chain = self.confidence_prompt | self.llm | StrOutputParser()
+
     def evaluate(self, query: str, answer: str, documents: List[Document], latency_ms: int) -> ReviewResult:
-        """多维度评估入口"""
+        """
+        主评估入口 - 内部容错，对外始终返回合法结果
+        自动适配：小模型快速评估，大模型精准评估
+        """
 
-        # 维度1：置信度
-        confidence = self._evaluate_confidence(answer)
+        def safe_eval(func, default, *args, **kwargs):
+            """安全执行评估函数，异常时返回默认值"""
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                print(f"⚠️ 评估子项失败({func.__name__}): {e}")
+                return default
 
-        # 维度2：检索相关性
-        retrieval_relevance = self._evaluate_retrieval_relevance(query, documents)
+        start_time = time.time()
 
-        # 维度3：回答完整性
-        answer_completeness = self._evaluate_answer_completeness(query, answer)
+        # 并行计算各维度（带容错）
+        confidence = safe_eval(self._evaluate_confidence, 0.6, answer)
+        retrieval_relevance = safe_eval(self._evaluate_retrieval_relevance, 0.5, query, documents)
+        answer_completeness = safe_eval(self._evaluate_completeness, 0.6, query, answer)
+        hallucination_risk = safe_eval(self._evaluate_hallucination_risk, 0.5, answer, documents)
 
-        # 维度4：幻觉风险
-        hallucination_risk = self._evaluate_hallucination_risk(answer, documents)
+        eval_latency = int((time.time() - start_time) * 1000)
 
-        # 综合判断是否需要人工审核
-        needs_review = (
-                self.config.HUMAN_REVIEW_ENABLED and
-                (confidence < self.config.HUMAN_REVIEW_THRESHOLD or
-                 hallucination_risk > 0.5 or  # 幻觉风险高必审
-                 retrieval_relevance < 0.3)  # 检索质量差必审
-        )
+        # 组合策略触发审核（避免单一指标误杀）
+        needs_review = False
+        if getattr(self.config, 'human_review_enabled', False):
+            # 策略：低置信度 + 高幻觉 同时满足，或检索完全失败
+            if (confidence < self.human_review_threshold and hallucination_risk > 0.6):
+                needs_review = True
+            elif retrieval_relevance < 0.2:
+                needs_review = True
 
         return ReviewResult(
             confidence=confidence,
             retrieval_relevance=retrieval_relevance,
             answer_completeness=answer_completeness,
             hallucination_risk=hallucination_risk,
-            latency_ms=latency_ms,
+            latency_ms=latency_ms + eval_latency,
             needs_human_review=needs_review,
-            human_review_status=ReviewStatus.PENDING if needs_review else ReviewStatus.APPROVED
+            review_comment="评估完成"
         )
 
     def _evaluate_confidence(self, answer: str) -> float:
-        """评估答案质量"""
-        prompt = f"评估以下答案的质量（0-1分），考虑准确性、流畅性、有用性：\n\n{answer[:300]}"
-        try:
-            result = self.llm.invoke(prompt).strip()
-            # 提取可能的数字
-            import re
-            match = re.search(r'(\d+\.?\d*)', result)
-            score = float(match.group(1)) if match else 0.5
-            return max(0.0, min(1.0, score))  # 归一化
-        except Exception:
-            return 0.5
+        """置信度评估 - 解析数字并归一化"""
+        result = self.confidence_chain.invoke({
+            "answer": answer[:500],
+            "context": "",
+            "query": ""
+        }).strip()
+
+        # 提取数字（适配各种格式）
+        m = re.search(r"(0?\.\d+|1\.0|1)", result)
+        if m:
+            score = float(m.group(1))
+            # 智能归一化：如果是8-10分制，转为0-1
+            if score > 1.0 and score <= 10:
+                score = score / 10
+            return min(max(score, 0.0), 1.0)
+        return 0.6
 
     def _evaluate_retrieval_relevance(self, query: str, documents: List[Document]) -> float:
-        """评估检索相关性"""
+        """检索相关性 - 基于文档分数"""
         if not documents:
             return 0.0
 
-        # 从文档元数据中提取分数
         doc_scores = []
         for doc in documents[:3]:
-            score = doc.metadata.get("rerank_score")
-            if score is None:
-                score = doc.metadata.get("similarity", 0.0)
-            if isinstance(score, (int, float)):
+            score = (doc.metadata.get("rerank_score") or
+                     doc.metadata.get("hybrid_score") or
+                     doc.metadata.get("vector_score") or
+                     doc.metadata.get("bm25_score") or
+                     doc.metadata.get("score", 0.0))
+
+            if score is not None:
                 doc_scores.append(float(score))
+
+        # 没有分数但有文档，给中等分（小模型宽容策略）
+        if not doc_scores and documents:
+            return 0.6 if not self.strict_mode else 0.4
 
         return max(doc_scores) if doc_scores else 0.0
 
-    def _evaluate_answer_completeness(self, query: str, answer: str) -> float:
-        """评估回答完整性（是否覆盖问题所有要点）"""
-        prompt = f"""
-        问题: {query}
-        答案: {answer[:500]}
+    def _evaluate_completeness(self, query: str, answer: str) -> float:
+        """回答完整性 - 小模型用启发式，大模型用LLM判断"""
 
-        评估答案是否完整回答了问题（0-1分）：
-        - 1.0: 全面覆盖所有要点
-        - 0.6-0.9: 回答了主要部分
-        - <0.6: 遗漏关键信息
+        # 小模型策略：简单启发式（不调用LLM，省资源）
+        if not self.strict_mode:
+            length = len(answer)
+            if 50 <= length <= 200:
+                return 0.8
+            elif length > 20:
+                return 0.6
+            else:
+                return 0.3
 
-        只返回分数：
-        """
+        # 大模型策略：LLM判断（精准但耗资源）
+        prompt = f"""问题：{query}
+        回答：{answer[:300]}
+
+        评估回答完整性（0-1）：
+        - 1.0：全面覆盖所有要点
+        - 0.6-0.9：回答了主要部分  
+        - <0.6：遗漏关键信息
+
+        只返回数字："""
+
         try:
             result = self.llm.invoke(prompt).strip()
-            import re
             match = re.search(r'(\d+\.?\d*)', result)
             score = float(match.group(1)) if match else 0.6
-            return max(0.0, min(1.0, score))
-        except Exception:
+            return min(max(score, 0.0), 1.0)
+        except:
             return 0.6
 
     def _evaluate_hallucination_risk(self, answer: str, documents: List[Document]) -> float:
-        """评估幻觉风险"""
+        """
+        幻觉风险评估 - 策略模式核心
+        小模型：规则检测（快速）
+        大模型：LLM验证（精准）
+        """
         if not documents:
-            return 1.0  # 无文档支撑，风险最大
+            return 1.0
 
-        # 提取事实性陈述
         claims = self._extract_claims(answer)
         if not claims:
-            return 0.0  # 没有可验证陈述，风险低
+            return 0.0
 
-        # 检查每个陈述是否在文档中有支撑
-        unsupported_count = sum(1 for claim in claims if not self._is_supported_by_docs(claim, documents))
+        # 检测未支撑的陈述
+        unsupported = 0
+        for claim in claims:
+            # 策略选择：大模型用LLM验证，小模型用规则
+            is_supported = self._is_supported_by_docs(claim, documents)
 
-        # 风险 = 无支撑陈述 / 总陈述数
-        risk = unsupported_count / len(claims)
-        return min(1.0, risk * 2)  # 放大风险信号
+            if not is_supported:
+                # 小模型宽容：短句(<15字)不视为幻觉（可能是常识）
+                if not self.strict_mode and len(claim) < 15:
+                    continue
+                unsupported += 1
+
+        if not claims:
+            return 0.0
+
+        # 计算风险比例（小模型封顶0.8避免过度惩罚）
+        risk_ratio = unsupported / len(claims)
+        max_risk = 0.8 if not self.strict_mode else 1.0
+
+        return min(risk_ratio * 1.2, max_risk)
 
     def _extract_claims(self, answer: str) -> List[str]:
-        """用LLM提取事实性陈述"""
-        if len(answer) < 20:  # 太短，无需提取
+        """
+        提取事实陈述 - 策略化
+        小模型：简单分割（快速，不耗token）
+        大模型：LLM提取（精准）
+        """
+        if len(answer) < 20:
             return []
 
-        prompt = f"提取以下文本中的可验证事实陈述（每行一个，只提取明确的、可验证的事实）：\n\n{answer[:400]}"
+        max_claims = self.extract_claims_max
+
+        # 小模型策略：简单按句号分割（不调用LLM）
+        if not self.strict_mode:
+            import re
+            # 保护小数点
+            text = re.sub(r'(\d)\.(\d)', r'\1[DOT]\2', answer)
+            sentences = re.split(r'[。！？\n]+', text)
+
+            claims = []
+            for s in sentences:
+                s = s.strip().replace('[DOT]', '.')
+                if len(s) > 5 and len(s) < 100:
+                    claims.append(s)
+            return claims[:max_claims]
+
+        # 大模型策略：LLM智能提取
+        prompt = f"""从以下文本中提取{max_claims}个独立的事实陈述（每行一个）：
+        要求：明确的、可验证的短句，不要总结性语句
+
+        文本：{answer[:400]}
+
+        事实陈述："""
+
         try:
-            result = self.llm.invoke(prompt)
-            # 过滤空行和无效行
-            claims = [line.strip() for line in result.split("\n")
-                     if line.strip() and len(line.strip()) > 5]
-            return claims[:10]  # 最多10个，避免过多
-        except Exception:
-            return []
+            result = self.llm.invoke(prompt).strip()
+            claims = [
+                line.strip() for line in result.split("\n")
+                if line.strip() and len(line) > 5 and not line.startswith("•")
+            ]
+            return claims[:max_claims]
+        except Exception as e:
+            print(f"⚠️ LLM提取claims失败: {e}，退回到规则提取")
+            # 失败时退回到简单分割
+            return [s.strip() for s in answer.split("。") if len(s.strip()) > 10][:max_claims]
 
     def _is_supported_by_docs(self, claim: str, documents: List[Document]) -> bool:
-        """检查陈述是否在文档中有支撑"""
-        if not documents or not claim:
+        """
+        检查陈述是否有文档支撑 - 策略模式统一入口
+        根据配置自动选择规则或LLM验证
+        """
+        if not claim or not documents:
             return False
 
+        # 策略分支：大模型用LLM验证，小模型用规则
+        if self.use_llm_contradiction:
+            # 大模型：精准LLM验证
+            return self._llm_contradiction_check(claim, documents)
+        else:
+            # 小模型：轻量级规则验证
+            return self._rule_contradiction_check(claim, documents)
+
+    def _rule_contradiction_check(self, claim: str, documents: List[Document]) -> bool:
+        """轻量级规则检测（小模型用）- 基于关键词匹配"""
         claim_lower = claim.lower()
-        # 简单匹配：文档中是否包含该陈述
+
+        # 1. 简单子串匹配（快速）
         for doc in documents:
             if claim_lower in doc.page_content.lower():
                 return True
 
-        # 语义匹配：使用LLM判断蕴含关系
-        try:
-            doc_content = documents[0].page_content[:300]
-            prompt = f"根据文档判断陈述是否被支持（回答'是'或'否'）：\n\n文档: {doc_content}\n\n陈述: {claim}"
-            result = self.llm.invoke(prompt).lower()
-            return "是" in result or "yes" in result or "true" in result
-        except Exception:
-            return False
+        # 2. 关键词匹配（60%以上关键词出现即认为支持）
+        claim_words = set(claim_lower.split())
+        if len(claim_words) < 3:
+            return False  # 太短无法判断
 
-    def request_human_review(self, query: str, answer: str) -> dict:
-        """生成人工审核任务"""
-        return {
-            "task_id": f"review_{hash(query + answer) % 100000}",
-            "query": query,
-            "answer": answer,
-            "status": "pending",
-            "timestamp": None,
-            "reviewer": None,
-            "comment": ""
-        }
+        for doc in documents:
+            doc_text = doc.page_content.lower()
+            doc_words = set(doc_text.split())
+            overlap = len(claim_words & doc_words) / len(claim_words)
+            if overlap > 0.6:
+                return True
+
+        return False
+
+    def _llm_contradiction_check(self, claim: str, documents: List[Document]) -> bool:
+        """
+        LLM-based矛盾检测（大模型用）- 精准但耗时
+        适用于 deepseek-33b/qwen-14b 等大模型
+        """
+        # 取最相关的1-2篇文档（节省token）
+        sorted_docs = sorted(
+            documents,
+            key=lambda d: d.metadata.get("rerank_score", 0) or d.metadata.get("vector_score", 0),
+            reverse=True
+        )[:2]
+
+        # 截断文档内容（防止超出上下文）
+        context_parts = []
+        for i, doc in enumerate(sorted_docs, 1):
+            content = doc.page_content[:300].replace("\n", " ")
+            context_parts.append(f"[文档{i}] {content}...")
+
+        context = "\n".join(context_parts)
+
+        # 明确的三分类判断prompt
+        prompt = f"""作为事实核查专家，判断以下陈述是否与提供的文档内容矛盾。
+
+【文档内容】
+{context}
+
+【待核查陈述】
+"{claim}"
+
+【任务定义】
+- "矛盾"：文档明确说了与陈述相反的内容（如文档说"支持A"，陈述说"不支持A"）
+- "不矛盾"：文档支持该陈述，或文档未提及该陈述（无法验证不算矛盾）
+- 注意：文档未提及的内容不要判为矛盾，应判为"不矛盾"
+
+【输出要求】
+只回复以下两个词之一，不要解释：
+矛盾 / 不矛盾
+
+判断结果："""
+
+        try:
+            # 调用大模型判断
+            result = self.llm.invoke(prompt).strip().lower()
+
+            # 解析结果（包含"矛盾"且不含"不矛盾"）
+            is_contradictory = ("矛盾" in result or "contradict" in result) and "不矛盾" not in result
+
+            if is_contradictory:
+                print(f"  ⚠️ LLM检测到矛盾: '{claim[:30]}...'")
+
+            # 如果矛盾，返回False（表示"不支持"）
+            # 如果不矛盾，返回True（表示"支持"或"无法验证但不矛盾"）
+            return not is_contradictory
+
+        except Exception as e:
+            print(f"⚠️ LLM矛盾检测失败: {e}，退回到规则检测")
+            # 失败时退回到规则检测，保证不阻断流程
+            return self._rule_contradiction_check(claim, documents)
