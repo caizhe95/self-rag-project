@@ -1,16 +1,20 @@
 # server.py
 import os
+import time
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, asdict
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
-import shutil
+
 from core.rag_chain import SelfRAGChain
-from core.agent_graph import SelfRAGAgent  # 新增：导入 Agent
+from core.agent_graph import SelfRAGAgent
 from config.setting import RAGConfig
 from storage.knowledge_source import FileSystemSource, KnowledgeManager
 
@@ -41,12 +45,118 @@ class ReviewResponse(BaseModel):
     data: Optional[Dict[str, Any]] = None
 
 
+class RetrievalConfigRequest(BaseModel):
+    """检索配置请求（AB测试用）"""
+    hybrid_weights: Dict[str, float] = {"bm25": 0.4, "vector": 0.6}
+    reranker_enabled: bool = True
+
+
+# ==================== 生产监控数据存储 ====================
+
+@dataclass
+class QueryMetrics:
+    """单次查询指标"""
+    timestamp: float
+    query: str
+    model: str
+    iteration_count: int
+    confidence: float
+    hallucination_risk: float
+    retrieval_duration_ms: float
+    total_duration_ms: float
+    docs_count: int
+    review_triggered: bool
+    status: str  # success/error
+
+
+class ProductionMonitor:
+    """生产环境监控 - 内存存储（面试时可扩展为Redis/DB）"""
+    MAX_HISTORY = 1000  # 保留最近1000条
+
+    def __init__(self):
+        self.history: List[QueryMetrics] = []
+        self.total_queries = 0
+        self.error_count = 0
+        self.review_triggered_count = 0
+
+    def record(self, metrics: QueryMetrics):
+        """记录查询指标"""
+        self.history.append(metrics)
+        self.total_queries += 1
+
+        if metrics.status == "error":
+            self.error_count += 1
+        if metrics.review_triggered:
+            self.review_triggered_count += 1
+
+        # 限制历史长度
+        if len(self.history) > self.MAX_HISTORY:
+            self.history.pop(0)
+
+    def get_dashboard_data(self) -> Dict[str, Any]:
+        """获取仪表盘数据"""
+        if not self.history:
+            return {"status": "no_data"}
+
+        recent = self.history[-100:]  # 最近100条
+
+        avg_confidence = sum(m.confidence for m in recent) / len(recent)
+        avg_hallucination = sum(m.hallucination_risk for m in recent) / len(recent)
+        avg_duration = sum(m.total_duration_ms for m in recent) / len(recent)
+
+        # 模型分布
+        model_stats = {}
+        for m in recent:
+            model_stats[m.model] = model_stats.get(m.model, 0) + 1
+
+        return {
+            "status": "healthy",
+            "overview": {
+                "total_queries": self.total_queries,
+                "recent_queries": len(recent),
+                "error_rate": self.error_count / max(self.total_queries, 1),
+                "review_trigger_rate": self.review_triggered_count / max(self.total_queries, 1),
+                "avg_confidence": round(avg_confidence, 2),
+                "avg_hallucination_risk": round(avg_hallucination, 2),
+                "avg_response_time_ms": round(avg_duration, 1),
+            },
+            "model_distribution": model_stats,
+            "recent_history": [asdict(m) for m in recent[-10:]]  # 最近10条详情
+        }
+
+    def get_alerts(self) -> List[Dict[str, Any]]:
+        """获取告警（置信度<0.5 或 幻觉>0.6）"""
+        alerts = []
+        for m in self.history[-50:]:  # 检查最近50条
+            if m.confidence < 0.5:
+                alerts.append({
+                    "type": "low_confidence",
+                    "timestamp": m.timestamp,
+                    "query": m.query[:50],
+                    "confidence": m.confidence,
+                    "severity": "warning"
+                })
+            if m.hallucination_risk > 0.6:
+                alerts.append({
+                    "type": "high_hallucination",
+                    "timestamp": m.timestamp,
+                    "query": m.query[:50],
+                    "risk": m.hallucination_risk,
+                    "severity": "critical"
+                })
+        return alerts
+
+
+# 创建全局监控实例
+monitor = ProductionMonitor()
+
+
 # ==================== 生命周期管理 ====================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期 - 智能切换知识源"""
-    global rag_chain, agent  # 新增：声明 agent 为全局
+    global rag_chain, agent
 
     print("🚀 初始化 Self-RAG 系统...")
 
@@ -108,7 +218,7 @@ async def lifespan(app: FastAPI):
     print("👋 系统关闭")
 
 
-app = FastAPI(title="Self-RAG Agent API", lifespan=lifespan)  # 修改：标题改为 Agent
+app = FastAPI(title="Self-RAG Agent API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -119,59 +229,115 @@ app.add_middleware(
 )
 
 rag_chain: Optional[SelfRAGChain] = None
-agent: Optional[SelfRAGAgent] = None  # 新增：全局 agent 变量
+agent: Optional[SelfRAGAgent] = None
 
 
 # ==================== API 路由 ====================
 
 @app.post("/api/query")
 async def query(req: QueryRequest):
-    """统一查询接口 - 使用 Agent"""
+    """增强版查询接口 - 返回详细检索信息"""
     try:
         if not agent:
             raise HTTPException(status_code=503, detail="Agent 未初始化")
 
-        # 使用 Agent 进行查询（自动处理工具调用和 Self-RAG 流程）
+        # 记录开始时间
+        start_time = time.time()
+        retrieval_start = time.time()
+
+        # 执行查询
         result = await agent.query(
             question=req.question,
             session_id=req.session_id or "default"
         )
 
-        # 转换返回格式以兼容现有前端（webui_user.py 等）
+        # 获取检索详情（复用已有结果）
+        retrieval_info = await rag_chain.get_retrieval_info(req.question)
+        retrieval_duration = (time.time() - retrieval_start) * 1000
+        total_duration = (time.time() - start_time) * 1000
+
+        # 构建详细sources
+        sources = []
+        for doc in retrieval_info.get("docs", []):
+            sources.append({
+                "source": doc.metadata.get("source", "unknown"),
+                "vector_score": doc.metadata.get("vector_score"),
+                "bm25_score": doc.metadata.get("bm25_score"),
+                "rerank_score": doc.metadata.get("rerank_score"),
+                "hybrid_score": doc.metadata.get("hybrid_score"),
+                "final_score": doc.metadata.get("final_score", 0),
+                "content_preview": doc.page_content[:50] + "..."
+            })
+
         return {
             "success": True,
             "data": {
                 "answer": result["answer"],
-                "confidence": result["confidence"],
-                "iteration": result["iterations"],  # Agent 返回的是 iterations（复数）
-                "sources": [],  # Agent 模式可能需要从状态中提取，这里留空或后续扩展
+                "confidence": result.get("confidence", 0),
+                "iteration": result.get("iterations", 0),
+                "sources": sources,
+                "retrieval_metrics": retrieval_info.get("metrics", {}),
+                "config_used": retrieval_info.get("config_used", {}),
+                "timing": {
+                    "retrieval_ms": retrieval_duration,
+                    "total_ms": total_duration
+                },
                 "review_task_id": result.get("review_task_id"),
                 "review_status": "pending" if result.get("needs_review") else None
             }
         }
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== 监控端点 ====================
+
+@app.get("/api/monitor/dashboard")
+async def monitor_dashboard():
+    """监控仪表盘数据"""
+    return monitor.get_dashboard_data()
+
+
+@app.get("/api/monitor/alerts")
+async def monitor_alerts():
+    """获取实时告警"""
+    return {
+        "alerts": monitor.get_alerts(),
+        "alert_count": len(monitor.get_alerts())
+    }
+
+
+@app.get("/api/monitor/history")
+async def monitor_history(limit: int = 100):
+    """查询历史记录"""
+    return {
+        "history": [asdict(m) for m in monitor.history[-limit:]],
+        "total": len(monitor.history)
+    }
+
+
 @app.get("/health")
 async def health():
-    """健康检查 - 显示当前模型配置"""
-    config_info = {
+    """健康检查 - 增强版"""
+    dashboard = monitor.get_dashboard_data()
+
+    return {
         "status": "healthy",
-        "mode": "agent",  # 修改：标识为 agent 模式
+        "mode": "agent",
         "model": rag_chain.config.llm_model if rag_chain else "unknown",
         "model_type": "大模型(32B)" if rag_chain and getattr(rag_chain.config, 'strict_mode', False) else "小模型(3B)",
         "document_count": len(
             rag_chain.retriever.hybrid_retriever.documents) if rag_chain and rag_chain.retriever else 0,
         "human_review_enabled": rag_chain.review_enabled if rag_chain else False,
-        "pending_reviews": len(rag_chain.get_pending_reviews()) if rag_chain else 0
+        "pending_reviews": len(rag_chain.get_pending_reviews()) if rag_chain else 0,
+        "monitor": dashboard.get("overview", {})
     }
-    return config_info
 
 
-# ==================== 审核相关接口（保持不变，直接操作 rag_chain） ====================
+# ==================== 审核相关接口（保持不变） ====================
 
 @app.get("/api/reviews/pending")
 async def get_pending_reviews():
@@ -210,7 +376,6 @@ async def submit_review(req: ReviewActionRequest, background_tasks: BackgroundTa
         if req.action == "modified" and (not req.modified_answer or req.modified_answer.strip() == ""):
             return ReviewResponse(success=False, message="修改答案不能为空", data=None)
 
-        # 通过 Agent 提交审核（Agent 内部会 resume 图执行）
         success = await agent.submit_review(
             task_id=req.task_id,
             action=req.action,
@@ -252,6 +417,88 @@ async def get_all_reviews(status: Optional[str] = None):
             "reviews": all_tasks
         }
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== AB测试配置端点（可选） ====================
+
+@app.post("/api/config/retrieval")
+async def update_retrieval_config(req: RetrievalConfigRequest):
+    """动态更新检索配置（AB测试用）"""
+    try:
+        if not rag_chain or not rag_chain.retriever:
+            raise HTTPException(status_code=503, detail="检索器未初始化")
+
+        await update_retrieval_config(
+            hybrid_weights=req.hybrid_weights,
+            reranker_enabled=req.reranker_enabled
+        )
+
+        return {
+            "success": True,
+            "message": "配置已更新",
+            "config": {
+                "hybrid_weights": req.hybrid_weights,
+                "reranker_enabled": req.reranker_enabled
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/config/retrieval/reset")
+async def reset_retrieval_config():
+    """恢复原始检索配置"""
+    try:
+        if rag_chain:
+            rag_chain.reset_retrieval_config()
+        return {"success": True, "message": "配置已恢复"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/retrieval/debug")
+async def debug_retrieval(query: str):
+    """
+    检索调试接口（返回详细信息，不生成答案）
+    用于AB测试分析检索质量
+    """
+    try:
+        if not rag_chain:
+            raise HTTPException(status_code=503, detail="RAG链未初始化")
+
+        result = await rag_chain.get_retrieval_info(query)
+
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+
+        # 格式化返回
+        docs_info = []
+        for doc in result["docs"]:
+            docs_info.append({
+                "source": doc.metadata.get("source", "unknown"),
+                "vector_score": doc.metadata.get("vector_score"),
+                "bm25_score": doc.metadata.get("bm25_score"),
+                "rerank_score": doc.metadata.get("rerank_score"),
+                "hybrid_score": doc.metadata.get("hybrid_score"),
+                "final_score": doc.metadata.get("final_score", 0),
+                "content_preview": doc.page_content[:100] + "..."
+            })
+
+        return {
+            "success": True,
+            "query": query,
+            "config_used": result["config_used"],
+            "metrics": result["metrics"],
+            "retrieved_docs": docs_info,
+            "vector_count": len(result.get("vector_docs", [])),
+            "bm25_count": len(result.get("bm25_docs", [])),
+            "final_count": len(result["docs"])
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 

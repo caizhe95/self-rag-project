@@ -586,3 +586,45 @@ class SelfRAGChain:
             "review_status": result.get("review_status"),
             "review_trigger_reason": result.get("review_trigger_reason")
         }
+
+    async def get_retrieval_info(self, query: str) -> Dict[str, Any]:
+        """
+        获取详细检索信息（AB测试用）
+
+        Returns:
+            {
+                "docs": List[Document],
+                "metrics": {...},
+                "config_used": {...}
+            }
+        """
+        if not self.retriever:
+            return {"error": "检索器未初始化"}
+
+        # 使用当前配置检索
+        result = await self.retriever.retrieve_with_config(query)
+
+        return {
+            "docs": result["docs"],
+            "vector_docs": result.get("vector_docs", []),
+            "bm25_docs": result.get("bm25_docs", []),
+            "metrics": result.get("metrics", {}),
+            "config_used": {
+                "hybrid_weights": self.retriever.hybrid_retriever.current_weights,
+                "reranker_enabled": self.retriever.hybrid_retriever.reranker_enabled
+            }
+        }
+
+    async def update_retrieval_config(
+            self,
+            hybrid_weights: Dict[str, float] = None,
+            reranker_enabled: bool = None
+    ):
+        """动态更新检索配置"""
+        if self.retriever:
+            self.retriever.update_config(hybrid_weights, reranker_enabled)
+
+    def reset_retrieval_config(self):
+        """恢复检索配置"""
+        if self.retriever:
+            self.retriever.reset_config()

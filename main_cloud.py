@@ -2,6 +2,7 @@
 import asyncio
 import os
 import sys
+import time
 import uuid
 import requests
 import numpy as np
@@ -90,12 +91,38 @@ def show_result(data):
     else:
         print(" | ✓通过")
 
+    # 新增：显示性能指标（面试时可以展示）
+    print(f"⏱️  响应时间: {data.get('duration_ms', 0):.0f}ms")
+
+
+def show_monitor_dashboard():
+    """显示监控仪表盘"""
+    try:
+        r = requests.get(f"{API_URL}/api/monitor/dashboard", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            overview = data.get("overview", {})
+
+            print("\n" + "=" * 50)
+            print("📊 系统监控仪表盘")
+            print("=" * 50)
+            print(f"总查询数: {overview.get('total_queries', 0)}")
+            print(f"平均置信度: {overview.get('avg_confidence', 0):.2f}")
+            print(f"平均响应: {overview.get('avg_response_time_ms', 0):.0f}ms")
+            print(f"错误率: {overview.get('error_rate', 0):.1%}")
+            print(f"审核触发率: {overview.get('review_trigger_rate', 0):.1%}")
+            print("=" * 50 + "\n")
+    except Exception as e:
+        print(f"⚠️  获取监控失败: {e}")
+
 
 async def main():
+    """主函数（只有一个！）"""
     print(f"🚀 Self-RAG Client [云端模式|DeepSeek-32B]")
     print(f"🧠 嵌入模型: bge-m3 | 语义相似度阈值: 65% | 最长10轮")
     print(f"⏱️  超时: 120秒（32B推理较慢）")
-    print(f"💡 'exit'=退出\n")
+    print(f"📊 实时监控: http://your-server:8000/api/monitor/dashboard")
+    print(f"💡 'exit'=退出 | 'monitor'=查看系统监控\n")
 
     # 检查模型
     try:
@@ -117,20 +144,26 @@ async def main():
             q = input("问题: ").strip()
             if q in ['exit', 'quit']:
                 break
+            if q == 'monitor':  # 监控命令
+                show_monitor_dashboard()
+                continue
             if not q:
                 continue
 
             sid, hist = mgr.get_session(q)
             print("推理中...", end="", flush=True)
 
+            start = time.time()
             res = requests.post(
                 f"{API_URL}/api/query",
                 json={"question": q, "session_id": sid, "chat_history": hist},
-                timeout=120,  # 32B慢，给120秒
+                timeout=120,
                 verify=False
             )
+            duration = (time.time() - start) * 1000
 
             data = res.json().get("data", {})
+            data['duration_ms'] = duration  # 添加耗时
             show_result(data)
             mgr.update(q, data.get('answer', ''))
 

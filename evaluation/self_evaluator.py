@@ -7,6 +7,8 @@ from langchain_core.output_parsers import StrOutputParser
 import re
 import time
 
+from tests.test_monitor import monitor_evaluation
+
 
 @dataclass
 class ReviewResult:
@@ -68,6 +70,7 @@ class SelfEvaluator:
 
         self.confidence_chain = self.confidence_prompt | self.llm | StrOutputParser()
 
+    @monitor_evaluation
     def evaluate(self, query: str, answer: str, documents: List[Document], latency_ms: int) -> ReviewResult:
         """
         主评估入口 - 内部容错，对外始终返回合法结果

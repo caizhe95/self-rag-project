@@ -1,6 +1,8 @@
 # core/agent_graph.py
-from typing import Annotated, Sequence, TypedDict, Literal, Optional
+from typing import Annotated, Sequence, TypedDict, Literal, Optional, Any
 import operator
+import asyncio
+import re
 
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_ollama import OllamaLLM
@@ -33,8 +35,7 @@ class AgentState(TypedDict):
 
 class SelfRAGAgent:
     """
-    Self-RAG Agent封装（适配你现有项目）
-    使用显式Schema定义工具，符合LangChain 1.0+标准
+    Self-RAG Agent封装（不使用 bind_tools，兼容 OllamaLLM）
     """
 
     def __init__(self, rag_chain: SelfRAGChain, config: RAGConfig):
@@ -53,107 +54,144 @@ class SelfRAGAgent:
             check_system_status
         ]
 
-        # 绑定工具的LLM
+        # 基础LLM（不使用 bind_tools）
         self.llm = OllamaLLM(
             model=config.llm_model,
             base_url=config.ollama_base_url,
             temperature=config.temperature
         )
-        self.llm_with_tools = self.llm.bind_tools(self.tools)
+        # 不使用 self.llm_with_tools，直接调用工具
 
-        # 预构建工具节点（自动处理Schema验证和State注入）
+        # 预构建工具节点
         self.tool_node = ToolNode(self.tools)
 
         # 构建图
         self.graph = self._build_graph()
 
         # 编译（启用interrupt）
-        self.compiled = self.graph.compile(
-            checkpointer=MemorySaver(),
-            interrupt_before=["human_review_node"]  # 人工审核前暂停
-        )
+        self.compiled = self.graph
 
-    def _build_graph(self) -> StateGraph:
+    def _build_graph(self) -> Any:
         """构建Agent工作流"""
 
         async def agent_node(state: AgentState) -> Command[
             Literal["tools", "evaluate", "human_review_node", "__end__"]]:
             """
             Agent决策节点：决定调用工具还是生成答案
+            不使用 bind_tools，通过 prompt 指导工具调用
             """
             messages = state["messages"]
 
             # 系统提示（指导Agent使用工具）
-            system_msg = SystemMessage(content="""你是Self-RAG智能助手，必须使用工具获取信息。
+            system_msg = SystemMessage(content="""你是Self-RAG智能助手。
+
+可用工具：
+1. retrieve_knowledge - 从知识库检索资料（必需的第一步）
+2. evaluate_answer_quality - 评估答案质量
+3. trigger_human_review - 触发人工审核（当置信度<0.5时使用）
 
 工作流程：
-1. 首先调用 retrieve_knowledge 检索资料（必须）
+1. 首先调用 retrieve_knowledge 检索资料
 2. 基于检索结果回答用户问题
 3. 调用 evaluate_answer_quality 评估答案质量
-4. 如果评估显示置信度低(<0.5)或幻觉风险高，调用 trigger_human_review
+4. 如果评估显示置信度低(<0.5)，调用 trigger_human_review
 
-约束：
-- 禁止编造知识库中没有的信息
-- 回答必须基于检索到的文档
-- 每次回答后必须进行质量评估""")
+请通过以下格式调用工具：
+TOOL: tool_name
+参数: {"key": "value"}
 
-            response = await self.llm_with_tools.ainvoke([system_msg] + list(messages))
+或直接回答问题（当你已有足够信息时）。""")
 
-            # 检查是否触发工具调用
-            if hasattr(response, 'tool_calls') and response.tool_calls:
-                tool_name = response.tool_calls[0]["name"]
+            # 直接调用LLM，不绑定工具
+            response = await self.llm.ainvoke([system_msg] + list(messages))
 
-                # 如果是人工审核工具，直接路由到审核节点
-                if tool_name == "trigger_human_review":
-                    return Command(
-                        goto="human_review_node",
-                        update={"messages": [response], "needs_review": True}
+            # 解析工具调用（从文本中解析）
+            content = response.content if hasattr(response, 'content') else str(response)
+
+            # 检查是否包含工具调用标记
+            if "TOOL:" in content:
+                lines = content.strip().split('\n')
+                tool_line = next((l for l in lines if l.startswith("TOOL:")), None)
+
+                if tool_line:
+                    tool_name = tool_line.replace("TOOL:", "").strip().split()[0]
+
+                    # 提取参数
+                    param_line = next((l for l in lines if l.startswith("参数:")), None)
+                    params = {}
+                    if param_line:
+                        import json
+                        try:
+                            params_str = param_line.replace("参数:", "").strip()
+                            params = json.loads(params_str)
+                        except:
+                            pass
+
+                    # 创建工具调用消息
+                    tool_msg = AIMessage(
+                        content="",
+                        tool_calls=[{
+                            "name": tool_name,
+                            "args": params,
+                            "id": f"call_{hash(tool_name)}"
+                        }]
                     )
 
-                return Command(goto="tools", update={"messages": [response]})
+                    # 如果是人工审核工具
+                    if tool_name == "trigger_human_review":
+                        return Command(
+                            goto="human_review_node",
+                            update={"messages": list(messages) + [tool_msg], "needs_review": True}
+                        )
+
+                    return Command(goto="tools", update={"messages": list(messages) + [tool_msg]})
 
             # 没有工具调用，进入评估节点
             return Command(
                 goto="evaluate",
-                update={"messages": [response], "last_query": messages[-1].content if messages else ""}
+                update={
+                    "messages": list(messages) + [response] if isinstance(response, BaseMessage) else list(messages) + [
+                        AIMessage(content=content)],
+                    "last_query": messages[-1].content if messages else ""
+                }
             )
 
         async def evaluate_node(state: AgentState) -> Command[Literal["agent", "human_review_node", "__end__"]]:
             """
-            评估节点：检查答案质量，决定是否结束或继续优化
+            评估节点：检查答案质量
             """
             # 提取最后生成的答案
             last_answer = ""
             for msg in reversed(state["messages"]):
-                if isinstance(msg, AIMessage) and not msg.tool_calls:
-                    last_answer = msg.content
-                    break
+                if isinstance(msg, AIMessage) and not getattr(msg, 'tool_calls', None):
+                    if not msg.content.startswith("[系统评估]") and msg.content.strip():
+                        last_answer = msg.content
+                        break
 
             if not last_answer:
                 return Command(goto=END)
 
-            # 提取检索到的上下文（从之前的ToolMessage）
+            # 提取检索到的上下文
             contexts = []
             for msg in reversed(state["messages"]):
-                if isinstance(msg, ToolMessage) and msg.name == "retrieve_knowledge":
-                    # 解析artifact（存储在tool_message.artifact中）
-                    if hasattr(msg, 'artifact') and msg.artifact:
-                        contexts = [doc.page_content for doc in msg.artifact[:3]]
+                if isinstance(msg, ToolMessage) and getattr(msg, 'name', None) == "retrieve_knowledge":
+                    contexts = [msg.content] if msg.content else []
                     break
 
             # 获取用户问题
             user_query = state.get("last_query", "")
 
-            # 调用评估工具
-            eval_result = evaluate_answer_quality.invoke({
-                "query": user_query,
-                "answer": last_answer,
-                "contexts": contexts,
-                "state": state  # 自动注入
-            })
+            # 直接调用评估工具（不通过LLM绑定）
+            try:
+                eval_result = evaluate_answer_quality.invoke({
+                    "query": user_query,
+                    "answer": last_answer,
+                    "contexts": contexts
+                })
+            except Exception as e:
+                eval_result = f"评估失败: {str(e)}，默认置信度50%"
 
-            # 解析置信度（从文本中提取）
-            import re
+            # 解析置信度
             match = re.search(r'置信度:\s*(\d+)%', eval_result)
             confidence = int(match.group(1)) / 100 if match else 0.5
 
@@ -161,7 +199,7 @@ class SelfRAGAgent:
             new_state = {
                 "confidence_score": confidence,
                 "iteration_count": state["iteration_count"] + 1,
-                "messages": state["messages"] + [AIMessage(content=f"[系统评估] {eval_result}")]
+                "messages": list(state["messages"]) + [AIMessage(content=f"[系统评估] {eval_result}")]
             }
 
             # 决策逻辑
@@ -178,7 +216,8 @@ class SelfRAGAgent:
                     goto="agent",
                     update={
                         **new_state,
-                        "messages": new_state["messages"] + [HumanMessage(content="请基于资料重新生成更准确的回答")]
+                        "messages": list(new_state["messages"]) + [
+                            HumanMessage(content="请基于资料重新生成更准确的回答")]
                     }
                 )
 
@@ -186,7 +225,7 @@ class SelfRAGAgent:
 
         def human_review_node(state: AgentState) -> Command[Literal["agent", "__end__"]]:
             """
-            人工审核节点：处理interrupt恢复
+            人工审核节点
             """
             if not state.get("needs_review"):
                 return Command(goto=END)
@@ -198,7 +237,7 @@ class SelfRAGAgent:
                 "query": state.get("last_query"),
                 "answer": next(
                     (m.content for m in reversed(state["messages"])
-                     if isinstance(m, AIMessage) and not m.tool_calls),
+                     if isinstance(m, AIMessage) and not getattr(m, 'tool_calls', None)),
                     ""
                 ),
                 "confidence": state.get("confidence_score")
@@ -215,7 +254,8 @@ class SelfRAGAgent:
                     goto="agent",
                     update={
                         "needs_review": False,
-                        "messages": state["messages"] + [HumanMessage(content="审核拒绝，请重新生成更准确、更详细的回答")]
+                        "messages": list(state["messages"]) + [
+                            HumanMessage(content="审核拒绝，请重新生成更准确、更详细的回答")]
                     }
                 )
 
@@ -224,7 +264,7 @@ class SelfRAGAgent:
                 return Command(
                     goto=END,
                     update={
-                        "messages": state["messages"] + [AIMessage(content=modified)],
+                        "messages": list(state["messages"]) + [AIMessage(content=modified)],
                         "needs_review": False
                     }
                 )
@@ -235,14 +275,17 @@ class SelfRAGAgent:
         workflow = StateGraph(AgentState)
 
         workflow.add_node("agent", agent_node)
-        workflow.add_node("tools", self.tool_node)  # ToolNode自动处理Schema验证
+        workflow.add_node("tools", self.tool_node)
         workflow.add_node("evaluate", evaluate_node)
         workflow.add_node("human_review_node", human_review_node)
 
         workflow.add_edge(START, "agent")
         workflow.add_edge("tools", "agent")
 
-        return workflow.compile()
+        return workflow.compile(
+            checkpointer=MemorySaver(),
+            interrupt_before=["human_review_node"]
+        )
 
     async def query(self, question: str, session_id: str = "default") -> dict:
         """对外查询接口"""
@@ -258,10 +301,10 @@ class SelfRAGAgent:
         config = {"configurable": {"thread_id": session_id}}
         result = await self.compiled.ainvoke(initial_state, config)
 
-        # 提取最终答案（过滤掉系统评估消息）
+        # 提取最终答案
         final_answer = ""
         for msg in reversed(result["messages"]):
-            if isinstance(msg, AIMessage) and not msg.tool_calls:
+            if isinstance(msg, AIMessage) and not getattr(msg, 'tool_calls', None):
                 if not msg.content.startswith("[系统评估]"):
                     final_answer = msg.content
                     break
@@ -275,7 +318,7 @@ class SelfRAGAgent:
         }
 
     async def submit_review(self, task_id: str, action: str, modified_answer: str = None):
-        """提交人工审核结果（恢复执行）"""
+        """提交人工审核结果"""
         from langgraph.types import Command
 
         resume_cmd = Command(resume={
